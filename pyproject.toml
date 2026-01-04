@@ -1,0 +1,26 @@
+[project]
+name = "qtzxchat"
+version = "0.1.0"
+description = "qtzx's implementation of a minimal full-stack LLM"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2.0",
+    "datasets>=3.0.0",
+    "tiktoken>=0.8.0",
+    "rustbpe>=0.1.0",
+    "tokenizers>=0.20.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "psutil>=6.0.0",
+    "regex>=2024.0.0",
+    "wandb>=0.18.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ipython>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
