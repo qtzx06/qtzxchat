@@ -45,11 +45,40 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+class Rotary(nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.inv_freq = None
+        self.cos_cached = None
+        self.sin_cached = None
+        self.seq_len_cached = 0
+
+    def forward(self, seq_len, device):
+        if seq_len > self.seq_len_cached or self.inv_freq is None or self.inv_freq.device != device:
+            self.seq_len_cached = seq_len
+            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
+            self.inv_freq = inv_freq
+            t = torch.arange(seq_len, device=device).float()
+            freqs = torch.outer(t, inv_freq)
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # relu^2 activation
+        x = self.c_proj(x)
+        return x
 
 
-            
-
- 
 
 
 
