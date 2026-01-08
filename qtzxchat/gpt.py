@@ -125,7 +125,100 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
 
+    def forward(self, x):
+        x = x + self.attn(norm(x))
+        x = x + self.mlp(norm(x))
+        return x
 
+class GPT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        # token embedding (untied from lm_head)
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        # transformer blocks
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        # output head (untied weights)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # init weights
+        self.apply(self._init_weights)
 
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def forward(self, idx, targets=None):
+        B, T = idx.size()
+        assert T <= self.config.sequence_len, f"Sequence length {T} exceeds max {self.config.sequence_len}"
+        # token embeddings with norm
+        x = norm(self.wte(idx))
+        # transformer blocks
+        for block in self.blocks:
+            x = block(x)
+        # final norm and projection
+        x = norm(x)
+        logits = self.lm_head(x)
+        # compute loss if targets provided
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, use_dist=False):
+        # separate params into decay and no-decay groups
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        # params that will use weight decay (2D params, i.e. matmul weights)
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # separate muon vs adamw params
+        muon_params = []
+        adamw_params = []
+        for name, p in param_dict.items():
+            if p.dim() >= 2 and 'wte' not in name and 'lm_head' not in name:
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
+        # create optimizer groups
+        optim_groups = [
+            {'params': adamw_params, 'lr': learning_rate, 'weight_decay': weight_decay},
+        ]
+        rank, world_size = get_dist_info()
+        if use_dist and world_size > 1:
+            optimizer = DistAdamW(optim_groups, betas=betas, fused=(device_type == 'cuda'))
+            if muon_params:
+                muon_opt = DistMuon(muon_params, lr=0.02, momentum=0.95)
+                return optimizer, muon_opt
+        else:
+            optimizer = torch.optim.AdamW(optim_groups, betas=betas, fused=(device_type == 'cuda'))
+            if muon_params:
+                muon_opt = Muon(muon_params, lr=0.02, momentum=0.95)
+                return optimizer, muon_opt
+        return optimizer, None
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        for _ in range(max_new_tokens):
+            # crop to sequence length
+            idx_cond = idx if idx.size(1) <= self.config.sequence_len else idx[:, -self.config.sequence_len:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
