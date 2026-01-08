@@ -78,8 +78,52 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        assert config.n_embd % config.n_head == 0
+        assert config.n_head % config.n_kv_head == 0
+        self.n_rep = config.n_head // config.n_kv_head # repetition factor for GQA
+        # query, key, value projections
+        self.c_q = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_k = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        # rotary embeddings
+        self.rotary = Rotary(self.head_dim)
 
-
+    def forward(self, x):
+        B, T, C = x.size()
+        # compute q, k, v
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        # apply QK norm before rotary
+        q, k = norm(q), norm(k)
+        # get rotary embeddings
+        cos, sin = self.rotary(T, x.device)
+        # apply rotary embeddings
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        # repeat k, v for GQA
+        if self.n_rep > 1:
+            k = k.unsqueeze(3).expand(B, T, self.n_kv_head, self.n_rep, self.head_dim).reshape(B, T, self.n_head, self.head_dim)
+            v = v.unsqueeze(3).expand(B, T, self.n_kv_head, self.n_rep, self.head_dim).reshape(B, T, self.n_head, self.head_dim)
+        # transpose for attention: (B, n_head, T, head_dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        # flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # reassemble
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        return y
 
 
 
